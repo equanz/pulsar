@@ -41,7 +41,7 @@ import org.testng.annotations.Test;
 @Test(groups = "broker")
 public class MangedLedgerInterceptorImplTest2 extends MockedBookKeeperTestCase {
 
-    public static void switchLedgerManually(ManagedLedgerImpl ledger){
+    private static void switchLedgerManually(ManagedLedgerImpl ledger){
         LedgerHandle originalLedgerHandle = ledger.currentLedger;
         ledger.ledgerClosed(ledger.currentLedger);
         ledger.createLedgerAfterClosed();
