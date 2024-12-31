@@ -129,6 +129,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     public void asyncAddEntry(ByteBuf buffer, int numberOfMessages, AsyncCallbacks.AddEntryCallback callback,
                               Object ctx) {
         // TODO: impl
+        callback.addFailed(ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()), ctx);
     }
 
     @Override
@@ -203,7 +204,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
     @Override
     public void asyncDeleteCursor(String name, AsyncCallbacks.DeleteCursorCallback callback, Object ctx) {
-        // TOOD: impl
+        // TODO: impl
     }
 
     @Override

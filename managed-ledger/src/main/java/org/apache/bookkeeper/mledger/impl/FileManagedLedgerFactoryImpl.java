@@ -21,10 +21,12 @@ package org.apache.bookkeeper.mledger.impl;
 import static org.apache.bookkeeper.mledger.ManagedLedgerException.getManagedLedgerException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.common.util.OrderedScheduler;
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.ManagedLedger;
@@ -40,13 +42,17 @@ import org.apache.bookkeeper.mledger.ReadOnlyCursor;
 import org.apache.bookkeeper.mledger.impl.cache.EntryCacheManager;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.PersistentOfflineTopicStats;
+import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 
+@Slf4j
 public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     private final ManagedLedgerFactoryConfig config;
     @Getter
     private final OrderedScheduler scheduledExecutor;
     private final MetaStore store;
+    protected final ConcurrentHashMap<String, CompletableFuture<FileManagedLedgerImpl>> ledgers =
+            new ConcurrentHashMap<>();
 
     public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig config,
                                         MetadataStoreExtended metadataStore) {
@@ -109,9 +115,18 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     @Override
     public void asyncOpen(String name, ManagedLedgerConfig config, AsyncCallbacks.OpenLedgerCallback callback,
                           Supplier<CompletableFuture<Boolean>> mlOwnershipChecker, Object ctx) {
-        // TODO: impl
-        callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()),
-                ctx);
+        ledgers.computeIfAbsent(name, (mlName) -> {
+            final CompletableFuture<FileManagedLedgerImpl> future = new CompletableFuture<>();
+            final FileManagedLedgerImpl ml = new FileManagedLedgerImpl(mlName, config);
+            future.complete(ml);
+
+            return future;
+        }).thenAccept(ml -> callback.openLedgerComplete(ml, ctx))
+        .exceptionally((ex) -> {
+            callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(
+                    FutureUtil.unwrapCompletionException(ex)), ctx);
+            return null;
+        });
     }
 
     @Override
