@@ -4,6 +4,7 @@ import static org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl.AsyncOperatio
 import com.google.common.collect.Range;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import java.io.FileOutputStream;
 import java.util.Collections;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -14,6 +15,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import lombok.extern.slf4j.Slf4j;
@@ -26,23 +28,43 @@ import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerMXBean;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
+import org.apache.bookkeeper.mledger.PositionFactory;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 import org.apache.bookkeeper.mledger.proto.MLDataFormats.ManagedLedgerInfo.LedgerInfo;
 import org.apache.bookkeeper.mledger.proto.PendingBookieOpsStats;
 import org.apache.bookkeeper.mledger.util.StatsBuckets;
+import org.apache.bookkeeper.util.collections.ConcurrentLongLongHashMap;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.policies.data.ManagedLedgerInternalStats;
 
 @Slf4j
 public class FileManagedLedgerImpl implements ManagedLedger {
     private final String name;
-
     private volatile ManagedLedgerConfig config;
     private volatile ManagedLedgerImpl.State state = null;
+    private final ManagedCursorContainer cursors = new ManagedCursorContainer();
+    private final FileOutputStream currentLog;
+    private final AtomicLong nextLedgerIdCounter;
+    private final ConcurrentLongLongHashMap nextEntryIdCounter;
+    private final AtomicLong currentLedgerId;
 
-    public FileManagedLedgerImpl(String name, ManagedLedgerConfig config) {
+    public FileManagedLedgerImpl(String name, ManagedLedgerConfig config, AtomicLong nextLedgerIdCounter) {
         this.name = name;
         this.config = config;
+
+        // assume single process
+        this.nextLedgerIdCounter = nextLedgerIdCounter;
+
+        // create new ledgerId
+        this.currentLedgerId = new AtomicLong(nextLedgerIdCounter.getAndIncrement());
+        this.nextEntryIdCounter = ConcurrentLongLongHashMap.newBuilder().build();
+
+        try {
+            this.currentLog = new FileOutputStream("./data/fileml/ledger-" + currentLedgerId.get());
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -128,8 +150,21 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     @Override
     public void asyncAddEntry(ByteBuf buffer, int numberOfMessages, AsyncCallbacks.AddEntryCallback callback,
                               Object ctx) {
-        // TODO: impl
-        callback.addFailed(ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()), ctx);
+        try {
+            buffer.retain();
+            while (buffer.isReadable()) {
+                currentLog.write(buffer.readByte());
+            }
+            currentLog.flush();
+            final long ledgerId = currentLedgerId.get();
+            nextEntryIdCounter.putIfAbsent(ledgerId, 0);
+            final long entryId = nextEntryIdCounter.get(ledgerId);
+            log.info("ledgerId: {}, entryId: {}", ledgerId, entryId);
+            nextEntryIdCounter.addAndGet(ledgerId, 1);
+            callback.addComplete(PositionFactory.create(ledgerId, entryId), buffer, ctx);
+        } catch (Exception e) {
+            callback.addFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
+        }
     }
 
     @Override
@@ -266,7 +301,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     @Override
     public Iterable<ManagedCursor> getCursors() {
         // TODO: impl
-        return null;
+        return cursors;
     }
 
     @Override
@@ -416,7 +451,13 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     @Override
     public void asyncClose(AsyncCallbacks.CloseCallback callback, Object ctx) {
         // TODO: impl
-        callback.closeComplete(ctx);
+
+        try {
+            currentLog.close();
+            callback.closeComplete(ctx);
+        } catch (Exception e) {
+            callback.closeFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
+        }
     }
 
     private static final class MockManagedLedgerMXBean implements ManagedLedgerMXBean {

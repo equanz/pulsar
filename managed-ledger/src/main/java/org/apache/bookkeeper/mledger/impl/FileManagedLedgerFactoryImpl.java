@@ -19,11 +19,18 @@
 package org.apache.bookkeeper.mledger.impl;
 
 import static org.apache.bookkeeper.mledger.ManagedLedgerException.getManagedLedgerException;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -51,8 +58,10 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     @Getter
     private final OrderedScheduler scheduledExecutor;
     private final MetaStore store;
-    protected final ConcurrentHashMap<String, CompletableFuture<FileManagedLedgerImpl>> ledgers =
+    private final ConcurrentHashMap<String, CompletableFuture<FileManagedLedgerImpl>> ledgers =
             new ConcurrentHashMap<>();
+    private final File nextLedgerIdFile;
+    private final AtomicLong nextLedgerIdCounter;
 
     public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig config,
                                         MetadataStoreExtended metadataStore) {
@@ -69,6 +78,19 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
         this.store = new MetaStoreImpl(metadataStore, scheduledExecutor,
                 compressionConfigForManagedLedgerInfo,
                 compressionConfigForManagedCursorInfo);
+
+        // assume single process
+        nextLedgerIdFile = new File("./data/fileml/nextLedgerId");
+        if (nextLedgerIdFile.exists()) {
+            try (FileInputStream nextLedgerIdInput = new FileInputStream(nextLedgerIdFile);
+                 DataInputStream nextLedgerIdMarker = new DataInputStream(nextLedgerIdInput)) {
+                nextLedgerIdCounter = new AtomicLong(nextLedgerIdMarker.readLong());
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            nextLedgerIdCounter = new AtomicLong();
+        }
     }
 
     @Override
@@ -116,17 +138,17 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     public void asyncOpen(String name, ManagedLedgerConfig config, AsyncCallbacks.OpenLedgerCallback callback,
                           Supplier<CompletableFuture<Boolean>> mlOwnershipChecker, Object ctx) {
         ledgers.computeIfAbsent(name, (mlName) -> {
-            final CompletableFuture<FileManagedLedgerImpl> future = new CompletableFuture<>();
-            final FileManagedLedgerImpl ml = new FileManagedLedgerImpl(mlName, config);
-            future.complete(ml);
+                    final CompletableFuture<FileManagedLedgerImpl> future = new CompletableFuture<>();
+                    final FileManagedLedgerImpl ml = new FileManagedLedgerImpl(mlName, config, nextLedgerIdCounter);
+                    future.complete(ml);
 
-            return future;
-        }).thenAccept(ml -> callback.openLedgerComplete(ml, ctx))
-        .exceptionally((ex) -> {
-            callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(
-                    FutureUtil.unwrapCompletionException(ex)), ctx);
-            return null;
-        });
+                    return future;
+                }).thenAccept(ml -> callback.openLedgerComplete(ml, ctx))
+                .exceptionally((ex) -> {
+                    callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(
+                            FutureUtil.unwrapCompletionException(ex)), ctx);
+                    return null;
+                });
     }
 
     @Override
@@ -270,7 +292,13 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     @Override
     public CompletableFuture<Void> shutdownAsync() throws ManagedLedgerException, InterruptedException {
         // TODO: impl
-        return CompletableFuture.completedFuture(null);
+        try (FileOutputStream nextLedgerIdOutput = new FileOutputStream(nextLedgerIdFile);
+             DataOutputStream nextLedgerIdMarker = new DataOutputStream(nextLedgerIdOutput)) {
+            nextLedgerIdMarker.writeLong(nextLedgerIdCounter.get());
+            return CompletableFuture.completedFuture(null);
+        } catch (IOException e) {
+            return CompletableFuture.failedFuture(e);
+        }
     }
 
     @Override
