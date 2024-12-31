@@ -68,7 +68,7 @@ public class FileManagedLedgerClientFactory implements ManagedLedgerStorage {
 
         try {
             this.managedLedgerFactory =
-                    new FileManagedLedgerFactoryImpl(managedLedgerFactoryConfig);
+                    new FileManagedLedgerFactoryImpl(managedLedgerFactoryConfig, metadataStore);
         } catch (Exception e) {
             throw e;
         }
@@ -107,6 +107,14 @@ public class FileManagedLedgerClientFactory implements ManagedLedgerStorage {
 
     @Override
     public void close() throws IOException {
-        // TODO: implements
+        try {
+            if (null != managedLedgerFactory) {
+                managedLedgerFactory.shutdown();
+                log.info("Closed managed ledger factory");
+            }
+        } catch (Exception e) {
+            log.warn(e.getMessage(), e);
+            throw new IOException(e);
+        }
     }
 }

@@ -24,6 +24,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
+import lombok.Getter;
+import org.apache.bookkeeper.common.util.OrderedScheduler;
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.ManagedLedger;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
@@ -32,17 +34,35 @@ import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactoryMXBean;
 import org.apache.bookkeeper.mledger.ManagedLedgerInfo;
+import org.apache.bookkeeper.mledger.MetadataCompressionConfig;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.ReadOnlyCursor;
 import org.apache.bookkeeper.mledger.impl.cache.EntryCacheManager;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.PersistentOfflineTopicStats;
+import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 
 public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
-    private final ManagedLedgerFactoryConfig managedLedgerFactoryConfig;
+    private final ManagedLedgerFactoryConfig config;
+    @Getter
+    private final OrderedScheduler scheduledExecutor;
+    private final MetaStore store;
 
-    public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig managedLedgerFactoryConfig) {
-        this.managedLedgerFactoryConfig = managedLedgerFactoryConfig;
+    public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig config,
+                                        MetadataStoreExtended metadataStore) {
+        this.config = config;
+        MetadataCompressionConfig compressionConfigForManagedLedgerInfo =
+                config.getCompressionConfigForManagedLedgerInfo();
+        MetadataCompressionConfig compressionConfigForManagedCursorInfo =
+                config.getCompressionConfigForManagedCursorInfo();
+        this.scheduledExecutor = OrderedScheduler.newSchedulerBuilder()
+                .numThreads(config.getNumManagedLedgerSchedulerThreads())
+                .traceTaskExecution(config.isTraceTaskExecution())
+                .name("file-ml-scheduler")
+                .build();
+        this.store = new MetaStoreImpl(metadataStore, scheduledExecutor,
+                compressionConfigForManagedLedgerInfo,
+                compressionConfigForManagedCursorInfo);
     }
 
     @Override
@@ -90,6 +110,8 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     public void asyncOpen(String name, ManagedLedgerConfig config, AsyncCallbacks.OpenLedgerCallback callback,
                           Supplier<CompletableFuture<Boolean>> mlOwnershipChecker, Object ctx) {
         // TODO: impl
+        callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()),
+                ctx);
     }
 
     @Override
@@ -217,6 +239,8 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     public void asyncDelete(String name, CompletableFuture<ManagedLedgerConfig> mlConfigFuture,
                             AsyncCallbacks.DeleteLedgerCallback callback, Object ctx) {
         // TODO: impl
+        callback.deleteLedgerFailed(
+                ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()), ctx);
     }
 
     @Override
@@ -237,7 +261,7 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     @Override
     public CompletableFuture<Boolean> asyncExists(String ledgerName) {
         // TODO: impl
-        return null;
+        return CompletableFuture.failedFuture(new UnsupportedOperationException());
     }
 
     @Override
@@ -259,7 +283,7 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
 
     @Override
     public CompletableFuture<Map<String, String>> getManagedLedgerPropertiesAsync(String name) {
-        return CompletableFuture.failedFuture(new UnsupportedOperationException());
+        return store.getManagedLedgerPropertiesAsync(name);
     }
 
     @Override
@@ -365,6 +389,6 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
 
     @Override
     public ManagedLedgerFactoryConfig getConfig() {
-        return managedLedgerFactoryConfig;
+        return config;
     }
 }
