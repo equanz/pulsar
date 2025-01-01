@@ -139,8 +139,13 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
                           Supplier<CompletableFuture<Boolean>> mlOwnershipChecker, Object ctx) {
         ledgers.computeIfAbsent(name, (mlName) -> {
                     final CompletableFuture<FileManagedLedgerImpl> future = new CompletableFuture<>();
-                    final FileManagedLedgerImpl ml = new FileManagedLedgerImpl(mlName, config, nextLedgerIdCounter);
-                    future.complete(ml);
+                    try {
+                        final FileManagedLedgerImpl ml = new FileManagedLedgerImpl(mlName, config, nextLedgerIdCounter,
+                                store);
+                        future.complete(ml);
+                    } catch (Exception e) {
+                        future.completeExceptionally(e);
+                    }
 
                     return future;
                 }).thenAccept(ml -> callback.openLedgerComplete(ml, ctx))

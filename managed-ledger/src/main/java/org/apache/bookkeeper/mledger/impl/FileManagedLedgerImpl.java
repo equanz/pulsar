@@ -30,27 +30,34 @@ import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
 import org.apache.bookkeeper.mledger.PositionFactory;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
+import org.apache.bookkeeper.mledger.proto.MLDataFormats;
 import org.apache.bookkeeper.mledger.proto.MLDataFormats.ManagedLedgerInfo.LedgerInfo;
 import org.apache.bookkeeper.mledger.proto.PendingBookieOpsStats;
 import org.apache.bookkeeper.mledger.util.StatsBuckets;
 import org.apache.bookkeeper.util.collections.ConcurrentLongLongHashMap;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.policies.data.ManagedLedgerInternalStats;
+import org.apache.pulsar.metadata.api.Stat;
 
 @Slf4j
 public class FileManagedLedgerImpl implements ManagedLedger {
     private final String name;
     private volatile ManagedLedgerConfig config;
+    private final MetaStore store;
     private volatile ManagedLedgerImpl.State state = null;
     private final ManagedCursorContainer cursors = new ManagedCursorContainer();
     private final FileOutputStream currentLog;
     private final AtomicLong nextLedgerIdCounter;
     private final ConcurrentLongLongHashMap nextEntryIdCounter;
     private final AtomicLong currentLedgerId;
+    private volatile Position lastConfirmedEntry;
 
-    public FileManagedLedgerImpl(String name, ManagedLedgerConfig config, AtomicLong nextLedgerIdCounter) {
+    public FileManagedLedgerImpl(String name, ManagedLedgerConfig config, AtomicLong nextLedgerIdCounter,
+                                 MetaStore store)
+            throws ManagedLedgerException {
         this.name = name;
         this.config = config;
+        this.store = store;
 
         // assume single process
         this.nextLedgerIdCounter = nextLedgerIdCounter;
@@ -64,6 +71,42 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         } catch (Exception e) {
             log.error(e.getMessage(), e);
             throw new RuntimeException(e);
+        }
+
+        final CountDownLatch counter = new CountDownLatch(1);
+        class Result {
+            ManagedLedgerException exception = null;
+        }
+        final Result result = new Result();
+
+        store.getManagedLedgerInfo(name, config.isCreateIfMissing(), config.getProperties(),
+                new MetaStore.MetaStoreCallback<>() {
+                    @Override
+                    public void operationComplete(MLDataFormats.ManagedLedgerInfo mlInfo, Stat stat) {
+                        MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
+                        lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
+                                terminatedPosition.getEntryId());
+                    }
+
+                    @Override
+                    public void operationFailed(ManagedLedgerException.MetaStoreException e) {
+                        if (e instanceof ManagedLedgerException.MetadataNotFoundException) {
+                            result.exception = new ManagedLedgerException.ManagedLedgerNotFoundException(e);
+                        } else {
+                            result.exception = new ManagedLedgerException(e);
+                        }
+                    }
+                }
+        );
+
+        try {
+            counter.await();
+        } catch (Exception e) {
+            throw ManagedLedgerException.getManagedLedgerException(e);
+        }
+
+        if (result.exception != null) {
+            throw result.exception;
         }
     }
 
@@ -296,6 +339,16 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                                 Map<String, String> cursorProperties, AsyncCallbacks.OpenCursorCallback callback,
                                 Object ctx) {
         // TODO: impl
+        final ManagedCursor cachedCursor = cursors.get(cursorName);
+        if (cachedCursor != null) {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Cursor was already created {}", name, cachedCursor);
+            }
+            callback.openCursorComplete(cachedCursor, ctx);
+            return;
+        }
+
+        final ManagedCursor cursor = new FileManagedCursorImpl(this, cursorName);
     }
 
     @Override
@@ -905,5 +958,9 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     public Position getFirstPosition() {
         // TODO: impl
         return null;
+    }
+
+    public Position getLastPosition() {
+        return this.lastConfirmedEntry;
     }
 }
