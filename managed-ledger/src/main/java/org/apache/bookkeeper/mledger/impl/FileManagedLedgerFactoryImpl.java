@@ -79,6 +79,8 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
                 compressionConfigForManagedLedgerInfo,
                 compressionConfigForManagedCursorInfo);
 
+        new File("./data/fileml").mkdirs();
+
         // assume single process
         nextLedgerIdFile = new File("./data/fileml/nextLedgerId");
         if (nextLedgerIdFile.exists()) {
@@ -340,7 +342,7 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
         return Map.of();
     }
 
-    private static final class MockManagedLedgerFactoryMXBean implements ManagedLedgerFactoryMXBean {
+    final ManagedLedgerFactoryMXBean mockStats = new ManagedLedgerFactoryMXBean() {
         @Override
         public int getNumberOfManagedLedgers() {
             return 0;
@@ -420,9 +422,7 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
         public long getCacheEntriesCount() {
             return 0;
         }
-    }
-
-    final ManagedLedgerFactoryMXBean mockStats = new MockManagedLedgerFactoryMXBean();
+    };
 
     @Override
     public ManagedLedgerFactoryMXBean getCacheStats() {

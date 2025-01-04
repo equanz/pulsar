@@ -1,23 +1,35 @@
 package org.apache.bookkeeper.mledger.impl;
 
+import static com.google.common.base.Preconditions.checkState;
 import static org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl.AsyncOperationTimeoutSeconds;
 import com.google.common.collect.Range;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
+import java.util.stream.LongStream;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.Entry;
@@ -37,6 +49,7 @@ import org.apache.bookkeeper.mledger.util.StatsBuckets;
 import org.apache.bookkeeper.util.collections.ConcurrentLongLongHashMap;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.policies.data.ManagedLedgerInternalStats;
+import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.Stat;
 
 @Slf4j
@@ -46,11 +59,17 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     private final MetaStore store;
     private volatile ManagedLedgerImpl.State state = null;
     private final ManagedCursorContainer cursors = new ManagedCursorContainer();
-    private final FileOutputStream currentLog;
+    private final FileInputStream currentLogInput;
+    private final FileOutputStream currentLogOutput;
+    private final ReadWriteLock currentLogLock;
     private final AtomicLong nextLedgerIdCounter;
     private final ConcurrentLongLongHashMap nextEntryIdCounter;
     private final AtomicLong currentLedgerId;
     private volatile Position lastConfirmedEntry;
+    private final List<Entry> entriesCache = new CopyOnWriteArrayList<>();
+    private final NavigableMap<Long, LedgerInfo> ledgerInfoMap = new ConcurrentSkipListMap<>();
+
+    private static final int ENTRY_HEADER_SIZE = Integer.BYTES;
 
     public FileManagedLedgerImpl(String name, ManagedLedgerConfig config, AtomicLong nextLedgerIdCounter,
                                  MetaStore store)
@@ -66,8 +85,12 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         this.currentLedgerId = new AtomicLong(nextLedgerIdCounter.getAndIncrement());
         this.nextEntryIdCounter = ConcurrentLongLongHashMap.newBuilder().build();
 
+        final File currentLogFile = new File("./data/fileml/ledger-" + currentLedgerId.get());
         try {
-            this.currentLog = new FileOutputStream("./data/fileml/ledger-" + currentLedgerId.get());
+            currentLogFile.createNewFile();
+            this.currentLogInput = new FileInputStream(currentLogFile);
+            this.currentLogOutput = new FileOutputStream(currentLogFile);
+            this.currentLogLock = new ReentrantReadWriteLock();
         } catch (Exception e) {
             log.error(e.getMessage(), e);
             throw new RuntimeException(e);
@@ -79,13 +102,19 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         }
         final Result result = new Result();
 
-        store.getManagedLedgerInfo(name, config.isCreateIfMissing(), config.getProperties(),
+        this.store.getManagedLedgerInfo(name, config.isCreateIfMissing(), config.getProperties(),
                 new MetaStore.MetaStoreCallback<>() {
                     @Override
                     public void operationComplete(MLDataFormats.ManagedLedgerInfo mlInfo, Stat stat) {
                         MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
                         lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
                                 terminatedPosition.getEntryId());
+
+                        for (LedgerInfo li : mlInfo.getLedgerInfoList()) {
+                            ledgerInfoMap.put(li.getLedgerId(), li);
+                        }
+
+                        counter.countDown();
                     }
 
                     @Override
@@ -95,6 +124,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                         } else {
                             result.exception = new ManagedLedgerException(e);
                         }
+                        counter.countDown();
                     }
                 }
         );
@@ -194,17 +224,35 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     public void asyncAddEntry(ByteBuf buffer, int numberOfMessages, AsyncCallbacks.AddEntryCallback callback,
                               Object ctx) {
         try {
+            // save to file
             buffer.retain();
-            while (buffer.isReadable()) {
-                currentLog.write(buffer.readByte());
+            final ByteBuf cacheBuffer = buffer.copy();
+            final Lock writeLock = currentLogLock.writeLock();
+            writeLock.lock();
+            try {
+                while (buffer.isReadable()) {
+                    // <payload size, 4 bytes>+<payload>
+                    currentLogOutput.write(buffer.readableBytes());
+                    currentLogOutput.write(buffer.readByte());
+                }
+                currentLogOutput.flush();
+
+                // calculate entryId
+                final long ledgerId = currentLedgerId.get();
+                nextEntryIdCounter.putIfAbsent(ledgerId, 0);
+                final long entryId = nextEntryIdCounter.get(ledgerId);
+                final Position pos = PositionFactory.create(ledgerId, entryId);
+                log.info("addEntry, position: {}", pos);
+                nextEntryIdCounter.addAndGet(ledgerId, 1);
+                lastConfirmedEntry = pos;
+
+                // save to the cache
+                entriesCache.add(EntryImpl.create(pos, cacheBuffer));
+
+                callback.addComplete(pos, buffer, ctx);
+            } finally {
+                writeLock.unlock();
             }
-            currentLog.flush();
-            final long ledgerId = currentLedgerId.get();
-            nextEntryIdCounter.putIfAbsent(ledgerId, 0);
-            final long entryId = nextEntryIdCounter.get(ledgerId);
-            log.info("ledgerId: {}, entryId: {}", ledgerId, entryId);
-            nextEntryIdCounter.addAndGet(ledgerId, 1);
-            callback.addComplete(PositionFactory.create(ledgerId, entryId), buffer, ctx);
         } catch (Exception e) {
             callback.addFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
         }
@@ -348,7 +396,24 @@ public class FileManagedLedgerImpl implements ManagedLedger {
             return;
         }
 
-        final ManagedCursor cursor = new FileManagedCursorImpl(this, cursorName);
+        final FileManagedCursorImpl cursor = new FileManagedCursorImpl(this, cursorName);
+        cursor.initializeCursorPosition(initialPosition == InitialPosition.Earliest
+                ? getFirstPosition()
+                : getLastPosition());
+        addCursor(cursor);
+
+        callback.openCursorComplete(cursor, ctx);
+    }
+
+    private void addCursor(ManagedCursor cursor) {
+        Position positionForOrdering = null;
+        if (cursor.isDurable()) {
+            positionForOrdering = cursor.getMarkDeletedPosition();
+            if (positionForOrdering == null) {
+                positionForOrdering = PositionFactory.EARLIEST;
+            }
+        }
+        cursors.add(cursor, positionForOrdering);
     }
 
     @Override
@@ -506,14 +571,14 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         // TODO: impl
 
         try {
-            currentLog.close();
+            currentLogOutput.close();
             callback.closeComplete(ctx);
         } catch (Exception e) {
             callback.closeFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
         }
     }
 
-    private static final class MockManagedLedgerMXBean implements ManagedLedgerMXBean {
+    private final ManagedLedgerMXBean mockStats = new ManagedLedgerMXBean() {
         @Override
         public String getName() {
             return "";
@@ -698,10 +763,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         public StatsBuckets getInternalLedgerAddEntryLatencyBuckets() {
             return null;
         }
-    }
-
-    ;
-    private final ManagedLedgerMXBean mockStats = new MockManagedLedgerMXBean();
+    };
 
     @Override
     public ManagedLedgerMXBean getStats() {
@@ -803,8 +865,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
     @Override
     public Position getLastConfirmedEntry() {
-        // TODO: impl
-        return null;
+        return lastConfirmedEntry;
     }
 
     @Override
@@ -910,6 +971,87 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     @Override
     public void asyncReadEntry(Position position, AsyncCallbacks.ReadEntryCallback callback, Object ctx) {
         // TODO: impl
+        final Optional<Entry> cachedEntry =
+                entriesCache.stream().filter(e -> e.getPosition().compareTo(position) == 0).findFirst();
+        cachedEntry.ifPresentOrElse(e -> callback.readEntryComplete(e, ctx), () -> {
+            final Lock readLock = currentLogLock.readLock();
+            readLock.lock();
+            try {
+                int offset = 0;
+                int nextOffset = 0;
+                byte[] entrySizeBuffer = new byte[Integer.BYTES];
+                for (int i = 0; i < position.getEntryId() + 1; i++) {
+                    offset = nextOffset;
+                    currentLogInput.readNBytes(entrySizeBuffer, offset, Integer.BYTES);
+                    nextOffset += ENTRY_HEADER_SIZE + ByteBuffer.wrap(entrySizeBuffer).getInt();
+                }
+                final int entrySize = ByteBuffer.wrap(entrySizeBuffer).getInt();
+                final ByteBuf buffer = Unpooled.buffer(entrySize);
+                currentLogInput.readNBytes(buffer.array(), offset + ENTRY_HEADER_SIZE, entrySize);
+
+                // TODO: re-add to cache, reconsider cache impl class
+                callback.readEntryComplete(EntryImpl.create(position, buffer), ctx);
+            } catch (IOException e) {
+                callback.readEntryFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
+            } finally {
+                readLock.unlock();
+            }
+        });
+    }
+
+    public void asyncReadEntries(FileManagedCursorImpl.OpReadEntries op, Object ctx) {
+        // TODO: impl
+
+        final Position firstPosition = op.readPosition;
+        final Position lastPosition = lastConfirmedEntry;
+
+        if (firstPosition.compareTo(lastPosition) > 0) {
+            op.readEntriesFailed(new ManagedLedgerException.NoMoreEntriesToReadException(
+                    "readPosition " + firstPosition + " is greater than lastConfirmedEntry " + lastPosition), ctx);
+        }
+
+        if (firstPosition.getLedgerId() == lastPosition.getLedgerId()) {
+            final List<Entry> entriesToRead = entriesCache.stream().filter(e ->
+                    e.getEntryId() >= firstPosition.getEntryId() && e.getEntryId() <= lastPosition.getEntryId()
+            ).sorted().limit(op.maxEntries).toList();
+
+            final Entry firstCachedEntry = entriesToRead.get(0);
+            if (firstCachedEntry == null || firstCachedEntry.getEntryId() != firstPosition.getEntryId()) {
+                final List<CompletableFuture<Entry>> entriesToReadFuture =
+                        LongStream.rangeClosed(firstPosition.getEntryId(), lastPosition.getEntryId())
+                                .boxed()
+                                .map(eId -> {
+                                    final CompletableFuture<Entry> future = new CompletableFuture<>();
+                                    asyncReadEntry(PositionFactory.create(firstPosition.getLedgerId(), eId),
+                                            new AsyncCallbacks.ReadEntryCallback() {
+                                                @Override
+                                                public void readEntryComplete(Entry entry, Object ctx) {
+                                                    future.complete(entry);
+                                                }
+
+                                                @Override
+                                                public void readEntryFailed(ManagedLedgerException exception,
+                                                                            Object ctx) {
+                                                    future.completeExceptionally(exception);
+                                                }
+                                            }, ctx);
+                                    return future;
+                                }).toList();
+                final CompletableFuture<Void> allFuture = FutureUtil.waitForAll(entriesToReadFuture);
+                allFuture.whenComplete((__, e) -> {
+                    if (e != null) {
+                        op.readEntriesFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
+                    }
+                    op.readEntriesComplete(entriesToReadFuture.stream().map(CompletableFuture::join).toList(), ctx);
+                });
+            } else {
+                op.readEntriesComplete(entriesToRead, ctx);
+            }
+        } else {
+            // TODO: impl, different ledger
+            // mock
+            op.readEntriesComplete(List.of(), ctx);
+        }
     }
 
     @Override
@@ -956,8 +1098,15 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
     @Override
     public Position getFirstPosition() {
-        // TODO: impl
-        return null;
+        Long ledgerId = ledgerInfoMap.firstKey();
+        if (ledgerId == null) {
+            return null;
+        }
+        if (ledgerId > lastConfirmedEntry.getLedgerId()) {
+            checkState(ledgerInfoMap.get(ledgerId).getEntries() == 0);
+            ledgerId = lastConfirmedEntry.getLedgerId();
+        }
+        return PositionFactory.create(ledgerId, -1);
     }
 
     public Position getLastPosition() {

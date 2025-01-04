@@ -209,10 +209,65 @@ public class FileManagedCursorImpl implements ManagedCursor {
         asyncReadEntriesOrWait(numberOfEntriesToRead, NO_MAX_SIZE_LIMIT, callback, ctx, maxPosition);
     }
 
+    public static final class OpReadEntries implements AsyncCallbacks.ReadEntriesCallback {
+        public final Position readPosition;
+        public final int maxEntries;
+        public final long maxSizeBytes;
+        public final Position maxPosition;
+        private final AsyncCallbacks.ReadEntriesCallback callback;
+        private final CountDownLatch latch;
+
+        public OpReadEntries(Position readPosition, int maxEntries, long maxSizeBytes, Position maxPosition,
+                             AsyncCallbacks.ReadEntriesCallback callback, CountDownLatch latch) {
+            this.readPosition = readPosition;
+            this.maxEntries = maxEntries;
+            this.maxSizeBytes = maxSizeBytes;
+            this.maxPosition = maxPosition;
+            this.callback = callback;
+            this.latch = latch;
+        }
+
+        @Override
+        public void readEntriesComplete(List<Entry> entries, Object ctx) {
+            callback.readEntriesComplete(entries, ctx);
+            latch.countDown();
+        }
+
+        @Override
+        public void readEntriesFailed(ManagedLedgerException exception, Object ctx) {
+            callback.readEntriesFailed(exception, ctx);
+            latch.countDown();
+        }
+    }
+
     @Override
     public void asyncReadEntriesOrWait(int maxEntries, long maxSizeBytes, AsyncCallbacks.ReadEntriesCallback callback,
                                        Object ctx, Position maxPosition) {
         // TODO: impl
+        final CountDownLatch countDownLatch = new CountDownLatch(1);
+
+        // spin if the backlog has no new messages
+        while (readPosition.compareTo(ml.getLastConfirmedEntry()) > 0) {
+            try {
+                Thread.sleep(100);
+            } catch (Exception e) {
+                callback.readEntriesFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
+                return;
+            }
+        }
+
+        final OpReadEntries op =
+                new OpReadEntries(readPosition, maxEntries, maxSizeBytes, maxPosition, callback, countDownLatch);
+
+        // simple tail read
+        ml.asyncReadEntries(op, ctx);
+
+        try {
+            countDownLatch.await();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
         callback.readEntriesFailed(
                 ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()), ctx);
     }
@@ -238,6 +293,10 @@ public class FileManagedCursorImpl implements ManagedCursor {
             return getNumberOfEntries() > 0;
         }
          */
+    }
+
+    public void initializeCursorPosition(Position position) {
+        this.readPosition = position.getNext();
     }
 
     @Override
@@ -760,7 +819,7 @@ public class FileManagedCursorImpl implements ManagedCursor {
         return new long[0];
     }
 
-    private static final class MockManagedCursorMXBean implements ManagedCursorMXBean {
+    private final ManagedCursorMXBean mockManagedCursorStats = new ManagedCursorMXBean() {
         @Override
         public String getName() {
             return "";
@@ -825,9 +884,7 @@ public class FileManagedCursorImpl implements ManagedCursor {
         public long getReadCursorLedgerSize() {
             return 0;
         }
-    }
-
-    private final ManagedCursorMXBean mockManagedCursorStats = new MockManagedCursorMXBean();
+    };
 
     @Override
     public ManagedCursorMXBean getStats() {
