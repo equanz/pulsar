@@ -59,11 +59,11 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     private final MetaStore store;
     private volatile ManagedLedgerImpl.State state = null;
     private final ManagedCursorContainer cursors = new ManagedCursorContainer();
-    private final FileChannel currentLogOutputChannel;
-    private final FileChannel currentLogInputChannel;
+    private FileChannel currentLogOutputChannel;
+    private FileChannel currentLogInputChannel;
     private final FileManagedLedgerFactoryImpl.AtomicLongWithSave nextLedgerIdCounter;
     private final ConcurrentLongLongHashMap nextEntryIdCounter;
-    private final AtomicLong currentLedgerId;
+    private final AtomicLong currentLedgerId = new AtomicLong();
     private volatile Position lastConfirmedEntry;
     private final List<Entry> entriesCache = new CopyOnWriteArrayList<>();
     private final NavigableMap<Long, LedgerInfo> ledgerInfoMap = new ConcurrentSkipListMap<>();
@@ -80,41 +80,44 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
         // assume single process
         this.nextLedgerIdCounter = nextLedgerIdCounter;
-
-        // create new ledgerId
-        try {
-            this.currentLedgerId = new AtomicLong(nextLedgerIdCounter.getAndIncrementWithSave());
-        } catch (IOException e) {
-            throw ManagedLedgerException.getManagedLedgerException(e);
-        }
-
         this.nextEntryIdCounter = ConcurrentLongLongHashMap.newBuilder().build();
-
-        final Path currentLogFile = Path.of("./data/fileml/ledger-" + currentLedgerId.get());
-        try {
-            this.currentLogOutputChannel =
-                    FileChannel.open(currentLogFile,
-                            StandardOpenOption.APPEND, StandardOpenOption.CREATE, StandardOpenOption.DSYNC);
-            this.currentLogInputChannel = FileChannel.open(currentLogFile, StandardOpenOption.READ);
-        } catch (Exception e) {
-            log.error(e.getMessage(), e);
-            throw new RuntimeException(e);
-        }
 
         final CompletableFuture<Void> mlInfoFuture = new CompletableFuture<>();
         this.store.getManagedLedgerInfo(name, config.isCreateIfMissing(), config.getProperties(),
                 new MetaStore.MetaStoreCallback<>() {
                     @Override
                     public void operationComplete(MLDataFormats.ManagedLedgerInfo mlInfo, Stat stat) {
-                        MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
-                        lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
-                                terminatedPosition.getEntryId());
-
-                        for (LedgerInfo li : mlInfo.getLedgerInfoList()) {
-                            ledgerInfoMap.put(li.getLedgerId(), li);
+                        if (mlInfo.hasTerminatedPosition()) {
+                            final MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
+                            lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
+                                    terminatedPosition.getEntryId());
                         }
 
-                        mlInfoFuture.complete(null);
+                        // TODO: impl, support multiple ledgers
+                        long lastLedgerId = -1;
+                        for (LedgerInfo li : mlInfo.getLedgerInfoList()) {
+                            ledgerInfoMap.put(li.getLedgerId(), li);
+
+                            nextEntryIdCounter.put(li.getLedgerId(), li.getEntries());
+                            if (lastLedgerId < li.getLedgerId()) {
+                                lastLedgerId = li.getLedgerId();
+                            }
+                        }
+                        // create new ledgerId if ledgerInfo is not existed
+                        try {
+                            if (lastLedgerId == -1) {
+                                lastLedgerId = nextLedgerIdCounter.getAndIncrementWithSave();
+                                lastConfirmedEntry = PositionFactory.create(lastLedgerId, -1);
+                            }
+                            if (lastConfirmedEntry == null) {
+                                lastConfirmedEntry =
+                                        PositionFactory.create(lastLedgerId, nextEntryIdCounter.get(lastLedgerId) - 1);
+                            }
+                            openCurrentLedger(lastLedgerId);
+                            mlInfoFuture.complete(null);
+                        } catch (Throwable e) {
+                            mlInfoFuture.completeExceptionally(e);
+                        }
                     }
 
                     @Override
@@ -133,6 +136,16 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         } catch (Exception e) {
             throw ManagedLedgerException.getManagedLedgerException(e);
         }
+    }
+
+    public void openCurrentLedger(long ledgerId) throws IOException {
+        currentLedgerId.set(ledgerId);
+
+        final Path currentLogFile = Path.of("./data/fileml/ledger-" + currentLedgerId.get());
+        this.currentLogOutputChannel =
+                FileChannel.open(currentLogFile,
+                        StandardOpenOption.APPEND, StandardOpenOption.CREATE, StandardOpenOption.DSYNC);
+        this.currentLogInputChannel = FileChannel.open(currentLogFile, StandardOpenOption.READ);
     }
 
     @Override
@@ -964,8 +977,6 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     public void checkCursorsToCacheEntries() {
         // no-op
     }
-
-    // TODO: implement read from file, fix consume first bug
 
     @Override
     public void asyncReadEntry(Position position, AsyncCallbacks.ReadEntryCallback callback, Object ctx) {
