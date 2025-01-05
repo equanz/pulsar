@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.stream.LongStream;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.Entry;
@@ -54,6 +55,7 @@ import org.apache.pulsar.metadata.api.Stat;
 public class FileManagedLedgerImpl implements ManagedLedger {
     private final String name;
     private volatile ManagedLedgerConfig config;
+    @Getter
     private final MetaStore store;
     private volatile ManagedLedgerImpl.State state = null;
     private final ManagedCursorContainer cursors = new ManagedCursorContainer();
@@ -99,12 +101,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
             throw new RuntimeException(e);
         }
 
-        final CountDownLatch counter = new CountDownLatch(1);
-        class Result {
-            ManagedLedgerException exception = null;
-        }
-        final Result result = new Result();
-
+        final CompletableFuture<Void> mlInfoFuture = new CompletableFuture<>();
         this.store.getManagedLedgerInfo(name, config.isCreateIfMissing(), config.getProperties(),
                 new MetaStore.MetaStoreCallback<>() {
                     @Override
@@ -117,29 +114,24 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                             ledgerInfoMap.put(li.getLedgerId(), li);
                         }
 
-                        counter.countDown();
+                        mlInfoFuture.complete(null);
                     }
 
                     @Override
                     public void operationFailed(ManagedLedgerException.MetaStoreException e) {
                         if (e instanceof ManagedLedgerException.MetadataNotFoundException) {
-                            result.exception = new ManagedLedgerException.ManagedLedgerNotFoundException(e);
+                            mlInfoFuture.completeExceptionally(e);
                         } else {
-                            result.exception = new ManagedLedgerException(e);
+                            mlInfoFuture.completeExceptionally(e);
                         }
-                        counter.countDown();
                     }
                 }
         );
 
         try {
-            counter.await();
+            mlInfoFuture.get();
         } catch (Exception e) {
             throw ManagedLedgerException.getManagedLedgerException(e);
-        }
-
-        if (result.exception != null) {
-            throw result.exception;
         }
     }
 
@@ -1045,16 +1037,18 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                     if (e != null) {
                         op.readEntriesFailed(ManagedLedgerException.getManagedLedgerException(e), ctx);
                     }
+                    op.setNextReadPosition(lastPosition.getNext());
                     op.readEntriesComplete(entriesToReadFuture.stream().map(CompletableFuture::join).toList(), ctx);
                 });
             } else {
+                op.setNextReadPosition(lastPosition.getNext());
                 op.readEntriesComplete(entriesToRead, ctx);
             }
         } else {
             // TODO: impl, different ledger
             // mock
             op.readEntriesFailed(ManagedLedgerException
-                            .getManagedLedgerException(new UnsupportedOperationException()), ctx);
+                    .getManagedLedgerException(new UnsupportedOperationException()), ctx);
         }
     }
 

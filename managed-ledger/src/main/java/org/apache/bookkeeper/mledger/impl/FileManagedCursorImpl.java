@@ -13,6 +13,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.Entry;
@@ -22,7 +23,9 @@ import org.apache.bookkeeper.mledger.ManagedLedger;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionFactory;
+import org.apache.bookkeeper.mledger.proto.MLDataFormats;
 import org.apache.pulsar.common.policies.data.ManagedLedgerInternalStats;
+import org.apache.pulsar.metadata.api.Stat;
 
 @Slf4j
 public class FileManagedCursorImpl implements ManagedCursor {
@@ -33,6 +36,7 @@ public class FileManagedCursorImpl implements ManagedCursor {
     private volatile Position markDeletePosition;
     private volatile Position persistentMarkDeletePosition;
     private volatile ManagedCursorImpl.State state = null;
+    private volatile Stat cursorLedgerStat;
 
     private static final long NO_MAX_SIZE_LIMIT = -1L;
 
@@ -210,25 +214,31 @@ public class FileManagedCursorImpl implements ManagedCursor {
     }
 
     public static final class OpReadEntries implements AsyncCallbacks.ReadEntriesCallback {
+        public final FileManagedCursorImpl cursor;
         public final Position readPosition;
         public final int maxEntries;
         public final long maxSizeBytes;
         public final Position maxPosition;
         private final AsyncCallbacks.ReadEntriesCallback callback;
         private final CountDownLatch latch;
+        @Setter
+        private Position nextReadPosition;
 
-        public OpReadEntries(Position readPosition, int maxEntries, long maxSizeBytes, Position maxPosition,
-                             AsyncCallbacks.ReadEntriesCallback callback, CountDownLatch latch) {
+        public OpReadEntries(FileManagedCursorImpl cursor, Position readPosition, int maxEntries, long maxSizeBytes,
+                             Position maxPosition, AsyncCallbacks.ReadEntriesCallback callback, CountDownLatch latch) {
+            this.cursor = cursor;
             this.readPosition = readPosition;
             this.maxEntries = maxEntries;
             this.maxSizeBytes = maxSizeBytes;
             this.maxPosition = maxPosition;
             this.callback = callback;
             this.latch = latch;
+            this.nextReadPosition = readPosition;
         }
 
         @Override
         public void readEntriesComplete(List<Entry> entries, Object ctx) {
+            cursor.updateReadPosition(nextReadPosition);
             callback.readEntriesComplete(entries, ctx);
             latch.countDown();
         }
@@ -238,6 +248,10 @@ public class FileManagedCursorImpl implements ManagedCursor {
             callback.readEntriesFailed(exception, ctx);
             latch.countDown();
         }
+    }
+
+    public void updateReadPosition(Position newReadPosition) {
+        this.readPosition = newReadPosition;
     }
 
     @Override
@@ -257,7 +271,7 @@ public class FileManagedCursorImpl implements ManagedCursor {
         }
 
         final OpReadEntries op =
-                new OpReadEntries(readPosition, maxEntries, maxSizeBytes, maxPosition, callback, countDownLatch);
+                new OpReadEntries(this, readPosition, maxEntries, maxSizeBytes, maxPosition, callback, countDownLatch);
 
         // simple tail read
         ml.asyncReadEntries(op, ctx);
@@ -295,6 +309,7 @@ public class FileManagedCursorImpl implements ManagedCursor {
 
     public void initializeCursorPosition(Position position) {
         this.readPosition = position.getNext();
+        this.markDeletePosition = position;
     }
 
     @Override
@@ -353,12 +368,46 @@ public class FileManagedCursorImpl implements ManagedCursor {
         asyncMarkDelete(position, Collections.emptyMap(), callback, ctx);
     }
 
+    private void updateCursorLedgerStat(Stat stat) {
+        this.cursorLedgerStat = stat;
+    }
+
     @Override
     public void asyncMarkDelete(Position position, Map<String, Long> properties,
                                 AsyncCallbacks.MarkDeleteCallback callback, Object ctx) {
         // TODO: impl
-        callback.markDeleteFailed(ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()),
-                ctx);
+
+        final Position lastConfirmedPosition = ml.getLastConfirmedEntry();
+        if (lastConfirmedPosition.compareTo(position) < 0) {
+            callback.markDeleteFailed(ManagedLedgerException
+                    .getManagedLedgerException(new RuntimeException(
+                            "lastConfirmedEntry " + lastConfirmedPosition + " is less than new mark delete position "
+                                    + position)), ctx);
+        }
+        markDeletePosition = position;
+
+        final Stat lastCursorLedgerStat = cursorLedgerStat;
+
+        final MLDataFormats.ManagedCursorInfo.Builder info = MLDataFormats.ManagedCursorInfo.newBuilder()
+                .setMarkDeleteLedgerId(position.getLedgerId())
+                .setMarkDeleteEntryId(position.getEntryId())
+                .setLastActive(lastActive);
+
+        final MLDataFormats.ManagedCursorInfo cursorInfo = info.build();
+
+        ml.getStore().asyncUpdateCursorInfo(ml.getName(), name, cursorInfo, lastCursorLedgerStat,
+                new MetaStore.MetaStoreCallback<>() {
+                    @Override
+                    public void operationComplete(Void result, Stat stat) {
+                        updateCursorLedgerStat(stat);
+                        callback.markDeleteComplete(ctx);
+                    }
+
+                    @Override
+                    public void operationFailed(ManagedLedgerException.MetaStoreException e) {
+                        callback.markDeleteFailed(e, ctx);
+                    }
+                });
     }
 
     @Override

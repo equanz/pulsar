@@ -66,12 +66,7 @@ public class FileManagedLedgerClientFactory implements ManagedLedgerStorage {
         managedLedgerFactoryConfig.setManagedCursorInfoCompressionThresholdInBytes(
                 conf.getManagedCursorInfoCompressionThresholdInBytes());
 
-        try {
-            this.managedLedgerFactory =
-                    new FileManagedLedgerFactoryImpl(managedLedgerFactoryConfig, metadataStore);
-        } catch (Exception e) {
-            throw e;
-        }
+        this.managedLedgerFactory = new FileManagedLedgerFactoryImpl(managedLedgerFactoryConfig, metadataStore);
 
         defaultStorageClass = new ManagedLedgerStorageClass() {
             @Override
