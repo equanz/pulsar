@@ -19,6 +19,7 @@
 package org.apache.bookkeeper.mledger.impl;
 
 import static org.apache.bookkeeper.mledger.ManagedLedgerException.getManagedLedgerException;
+import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
@@ -61,7 +62,7 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     private final ConcurrentHashMap<String, CompletableFuture<FileManagedLedgerImpl>> ledgers =
             new ConcurrentHashMap<>();
     private final File nextLedgerIdFile;
-    private final AtomicLong nextLedgerIdCounter;
+    private final AtomicLongWithSave nextLedgerIdCounter;
 
     public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig config,
                                         MetadataStoreExtended metadataStore) {
@@ -86,12 +87,40 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
         if (nextLedgerIdFile.exists()) {
             try (FileInputStream nextLedgerIdInput = new FileInputStream(nextLedgerIdFile);
                  DataInputStream nextLedgerIdMarker = new DataInputStream(nextLedgerIdInput)) {
-                nextLedgerIdCounter = new AtomicLong(nextLedgerIdMarker.readLong());
+                nextLedgerIdCounter = new AtomicLongWithSave(nextLedgerIdMarker.readLong(), nextLedgerIdFile);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
         } else {
-            nextLedgerIdCounter = new AtomicLong();
+            try {
+                nextLedgerIdCounter = new AtomicLongWithSave(0L, nextLedgerIdFile);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    public static final class AtomicLongWithSave extends AtomicLong implements Closeable {
+        private final FileOutputStream nextLedgerIdOutput;
+        private final DataOutputStream nextLedgerIdMarker;
+
+        public AtomicLongWithSave(long initialValue, File dstFile) throws IOException {
+            super(initialValue);
+            nextLedgerIdOutput = new FileOutputStream(dstFile);
+            nextLedgerIdMarker = new DataOutputStream(nextLedgerIdOutput);
+        }
+
+        public synchronized long getAndIncrementWithSave() throws IOException {
+            final long result = getAndIncrement();
+            nextLedgerIdMarker.writeLong(result + 1L);
+            return result;
+        }
+
+        @Override
+        public void close() throws IOException {
+            nextLedgerIdMarker.writeLong(get());
+            nextLedgerIdMarker.close();
+            nextLedgerIdOutput.close();
         }
     }
 
@@ -299,9 +328,8 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     @Override
     public CompletableFuture<Void> shutdownAsync() throws ManagedLedgerException, InterruptedException {
         // TODO: impl
-        try (FileOutputStream nextLedgerIdOutput = new FileOutputStream(nextLedgerIdFile);
-             DataOutputStream nextLedgerIdMarker = new DataOutputStream(nextLedgerIdOutput)) {
-            nextLedgerIdMarker.writeLong(nextLedgerIdCounter.get());
+        try {
+            nextLedgerIdCounter.close();
             return CompletableFuture.completedFuture(null);
         } catch (IOException e) {
             return CompletableFuture.failedFuture(e);

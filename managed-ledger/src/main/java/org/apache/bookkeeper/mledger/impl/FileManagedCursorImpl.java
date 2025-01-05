@@ -265,11 +265,9 @@ public class FileManagedCursorImpl implements ManagedCursor {
         try {
             countDownLatch.await();
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            callback.readEntriesFailed(
+                    ManagedLedgerException.getManagedLedgerException(e), ctx);
         }
-
-        callback.readEntriesFailed(
-                ManagedLedgerException.getManagedLedgerException(new UnsupportedOperationException()), ctx);
     }
 
     @Override
