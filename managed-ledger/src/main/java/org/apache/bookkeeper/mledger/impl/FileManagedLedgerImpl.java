@@ -24,6 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
@@ -67,6 +68,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
     private volatile Position lastConfirmedEntry;
     private final List<Entry> entriesCache = new CopyOnWriteArrayList<>();
     private final NavigableMap<Long, LedgerInfo> ledgerInfoMap = new ConcurrentSkipListMap<>();
+    private volatile Stat ledgersStat = null;
 
     private static final int ENTRY_HEADER_SIZE = Integer.BYTES;
 
@@ -87,24 +89,26 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                 new MetaStore.MetaStoreCallback<>() {
                     @Override
                     public void operationComplete(MLDataFormats.ManagedLedgerInfo mlInfo, Stat stat) {
-                        if (mlInfo.hasTerminatedPosition()) {
-                            final MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
-                            lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
-                                    terminatedPosition.getEntryId());
-                        }
-
-                        // TODO: impl, support multiple ledgers
-                        long lastLedgerId = -1;
-                        for (LedgerInfo li : mlInfo.getLedgerInfoList()) {
-                            ledgerInfoMap.put(li.getLedgerId(), li);
-
-                            nextEntryIdCounter.put(li.getLedgerId(), li.getEntries());
-                            if (lastLedgerId < li.getLedgerId()) {
-                                lastLedgerId = li.getLedgerId();
-                            }
-                        }
-                        // create new ledgerId if ledgerInfo is not existed
                         try {
+                            ledgersStat = stat;
+                            if (mlInfo.hasTerminatedPosition()) {
+                                final MLDataFormats.NestedPositionInfo terminatedPosition = mlInfo.getTerminatedPosition();
+                                lastConfirmedEntry = PositionFactory.create(terminatedPosition.getLedgerId(),
+                                        terminatedPosition.getEntryId());
+                            }
+
+                            // TODO: impl, support multiple ledgers
+                            long lastLedgerId = -1;
+                            for (LedgerInfo li : mlInfo.getLedgerInfoList()) {
+                                ledgerInfoMap.put(li.getLedgerId(), li);
+
+                                nextEntryIdCounter.put(li.getLedgerId(), li.getEntries());
+                                if (lastLedgerId < li.getLedgerId()) {
+                                    lastLedgerId = li.getLedgerId();
+                                }
+                            }
+
+                            // create new ledgerId if ledgerInfo is not existed
                             if (lastLedgerId == -1) {
                                 lastLedgerId = nextLedgerIdCounter.getAndIncrementWithSave();
                                 lastConfirmedEntry = PositionFactory.create(lastLedgerId, -1);
@@ -122,11 +126,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
                     @Override
                     public void operationFailed(ManagedLedgerException.MetaStoreException e) {
-                        if (e instanceof ManagedLedgerException.MetadataNotFoundException) {
-                            mlInfoFuture.completeExceptionally(e);
-                        } else {
-                            mlInfoFuture.completeExceptionally(e);
-                        }
+                        mlInfoFuture.completeExceptionally(e);
                     }
                 }
         );
@@ -134,6 +134,66 @@ public class FileManagedLedgerImpl implements ManagedLedger {
         try {
             mlInfoFuture.get();
         } catch (Exception e) {
+            log.error("ML initialization failed in ML info section", e);
+            throw ManagedLedgerException.getManagedLedgerException(e);
+        }
+
+        final CompletableFuture<Void> cursorsFuture = new CompletableFuture<>();
+        this.store.getCursors(name, new MetaStore.MetaStoreCallback<>() {
+            @Override
+            public void operationComplete(List<String> cursorNameList, Stat s) {
+                // Load existing cursors
+                final AtomicInteger cursorCount = new AtomicInteger(cursorNameList.size());
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] Found {} cursors", name, cursorNameList.size());
+                }
+
+                if (cursorNameList.isEmpty()) {
+                    cursorsFuture.complete(null);
+                    return;
+                }
+
+                log.debug("[{}] Loading cursors", name);
+
+                for (final String cursorName : cursorNameList) {
+                    log.info("[{}] Loading cursor {}", name, cursorName);
+                    final FileManagedCursorImpl cursor =
+                            new FileManagedCursorImpl(FileManagedLedgerImpl.this, cursorName);
+
+                    cursor.recover(new FileManagedCursorImpl.VoidCallback() {
+                        @Override
+                        public void operationComplete() {
+                            log.info("[{}] Recovery for cursor {} completed. pos={} -- todo={}", name, cursorName,
+                                    cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
+                            cursor.setActive();
+                            addCursor(cursor);
+
+                            if (cursorCount.decrementAndGet() == 0) {
+                                // The initialization is now completed
+                                cursorsFuture.complete(null);
+                            }
+                        }
+
+                        @Override
+                        public void operationFailed(ManagedLedgerException exception) {
+                            log.warn("[{}] Recovery for cursor {} failed", name, cursorName, exception);
+                            cursorCount.set(-1);
+                            cursorsFuture.completeExceptionally(exception);
+                        }
+                    });
+                }
+            }
+
+            @Override
+            public void operationFailed(ManagedLedgerException.MetaStoreException e) {
+                cursorsFuture.completeExceptionally(e);
+            }
+        });
+
+        try {
+            cursorsFuture.get();
+        } catch (Exception e) {
+            log.error("ML initialization failed in cursors info section", e);
             throw ManagedLedgerException.getManagedLedgerException(e);
         }
     }
@@ -253,6 +313,23 @@ public class FileManagedLedgerImpl implements ManagedLedger {
                 log.info("addEntry, position: {}", pos);
                 nextEntryIdCounter.addAndGet(ledgerId, 1);
                 lastConfirmedEntry = pos;
+
+                // TODO: impl, reduction of update frequency
+                // save new ledger info
+                final MLDataFormats.ManagedLedgerInfo mlInfo =
+                        MLDataFormats.ManagedLedgerInfo.newBuilder().addAllLedgerInfo(getLedgersInfo().values())
+                                .build();
+                store.asyncUpdateLedgerIds(name, mlInfo, ledgersStat, new MetaStore.MetaStoreCallback<>() {
+                    @Override
+                    public void operationComplete(Void result, Stat stat) {
+                        ledgersStat = stat;
+                    }
+
+                    @Override
+                    public void operationFailed(ManagedLedgerException.MetaStoreException e) {
+                        log.error("update store ledgerIds failed", e);
+                    }
+                });
 
                 // save to the cache
                 // disable cache
@@ -1065,8 +1142,7 @@ public class FileManagedLedgerImpl implements ManagedLedger {
 
     @Override
     public NavigableMap<Long, LedgerInfo> getLedgersInfo() {
-        // TODO: impl
-        return null;
+        return ledgerInfoMap;
     }
 
     @Override

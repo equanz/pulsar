@@ -67,9 +67,9 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     public FileManagedLedgerFactoryImpl(ManagedLedgerFactoryConfig config,
                                         MetadataStoreExtended metadataStore) {
         this.config = config;
-        MetadataCompressionConfig compressionConfigForManagedLedgerInfo =
+        final MetadataCompressionConfig compressionConfigForManagedLedgerInfo =
                 config.getCompressionConfigForManagedLedgerInfo();
-        MetadataCompressionConfig compressionConfigForManagedCursorInfo =
+        final MetadataCompressionConfig compressionConfigForManagedCursorInfo =
                 config.getCompressionConfigForManagedCursorInfo();
         this.scheduledExecutor = OrderedScheduler.newSchedulerBuilder()
                 .numThreads(config.getNumManagedLedgerSchedulerThreads())
@@ -108,11 +108,14 @@ public class FileManagedLedgerFactoryImpl implements ManagedLedgerFactory {
             super(initialValue);
             nextLedgerIdOutput = new FileOutputStream(dstFile);
             nextLedgerIdMarker = new DataOutputStream(nextLedgerIdOutput);
+            nextLedgerIdMarker.writeLong(initialValue);
+            nextLedgerIdMarker.flush();
         }
 
         public synchronized long getAndIncrementWithSave() throws IOException {
             final long result = getAndIncrement();
             nextLedgerIdMarker.writeLong(result + 1L);
+            nextLedgerIdMarker.flush();
             return result;
         }
 

@@ -312,6 +312,41 @@ public class FileManagedCursorImpl implements ManagedCursor {
         this.markDeletePosition = position;
     }
 
+    public interface VoidCallback {
+        void operationComplete();
+
+        void operationFailed(ManagedLedgerException exception);
+    }
+
+    /**
+     * Performs the initial recovery
+     */
+    public void recover(final VoidCallback callback) {
+        // Read the meta-data ledgerId from the store
+        log.info("[{}] Recovering from bookkeeper ledger cursor: {}", ml.getName(), name);
+        ml.getStore().asyncGetCursorInfo(ml.getName(), name, new MetaStore.MetaStoreCallback<>() {
+            @Override
+            public void operationComplete(MLDataFormats.ManagedCursorInfo info, Stat stat) {
+                updateCursorLedgerStat(stat);
+
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] [{}] Recover cursor last active to [{}]", ml.getName(), name, lastActive);
+                }
+
+                final Position recoveredPosition = PositionFactory.create(info.getMarkDeleteLedgerId(),
+                        info.getMarkDeleteEntryId());
+
+                initializeCursorPosition(recoveredPosition);
+                callback.operationComplete();
+            }
+
+            @Override
+            public void operationFailed(ManagedLedgerException.MetaStoreException e) {
+                callback.operationFailed(e);
+            }
+        });
+    }
+
     @Override
     public long getNumberOfEntries() {
         // mock
